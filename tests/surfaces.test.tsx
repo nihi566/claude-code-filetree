@@ -20,6 +20,7 @@ type World = {
   du?: Record<string, string>
   duDelays?: number[]
   links?: string[]
+  surfaces?: string[]
 }
 type Ran = string[][]
 const opens: unknown[] = []
@@ -32,6 +33,7 @@ function world(on: any, w: World, ran: Ran) {
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('session.cwd', () => ({ value: w.cwd }))
   on('session.id', () => ({ value: 'test-session' }))
+  on('session.surfaces', () => ({ value: w.surfaces ?? ['terminal'] }))
   on('command.register', () => ({ value: undefined }))
   on('ui.open', (_$: any, e: any) => {
     opens.push(e)
@@ -403,26 +405,90 @@ test('watches only git metadata, copies paths, clears search, Home and End', { t
   await ui.unmount()
 })
 
-test('sidebar only: no pane in the default layout, and an inline pane closes itself', { timeoutMs: 20_000 }, async ($, on) => {
+test('main screen: an unasked inline pane closes itself, /filetree opens one inline that stays',{ timeoutMs: 20_000 }, async ($, on) => {
   const ran: Ran = []
   const root = '/home/k/proj'
   const clock = world(on, { os: 'linux', env: { HOME: '/home/k' }, cwd: root, top: '', dirs: { [root]: [['a.txt', 'file']] }, status: '', numstat: '' }, ran)
-  const opened = opens
   const closed: unknown[] = []
   on('ui.close', (_$: any, e: any) => {
     closed.push(e)
-    return {}
+    return { value: undefined }
   })
   await $.session.start({ cwd: root, surface: 'terminal', isInteractive: true })
   await clock.settle()
-  const before = opened.length
-  const r = await $.command.run({ command: 'filetree', args: '', origin: { kind: 'person' }, presentation: { isFullscreen: false, columns: 200 } } as any)
-  expect(JSON.stringify(r)).toContain('/tui fullscreen')
-  expect(opened.length).toBe(before)
-  const ui = await $.ui.mount({ plugin: 'filetree', surface: 'terminal', component: 'Pane', requestId: 'filetree', props: { ...paneProps(60), placement: 'inline' } })
+  const inline = { ...paneProps(60), placement: 'inline' }
+  const unasked = await $.ui.mount({ plugin: 'filetree', surface: 'terminal', component: 'Pane', requestId: 'filetree', props: inline })
   await clock.settle()
-  expect(closed.length).toBeGreaterThan(0)
-  await ui.unmount()
+  expect(closed.length).toBe(1)
+  await unasked.unmount()
+  const before = opens.length
+  const r = await $.command.run({ command: 'filetree', args: '', origin: { kind: 'person' }, presentation: { isFullscreen: false, columns: 80 } } as any)
+  await clock.settle()
+  expect(JSON.stringify(r)).toContain('inline')
+  expect(opens.slice(before)).toContainEqual(expect.objectContaining({ id: 'filetree', focus: true, rows: 20 }))
+  const asked = await $.ui.mount({ plugin: 'filetree', surface: 'terminal', component: 'Pane', requestId: 'filetree', props: inline })
+  await clock.settle()
+  expect(closed.length).toBe(1)
+  expect(await texts(asked)).toContain(`"id":"${root}/a.txt"`)
+  await asked.unmount()
+})
+
+test('no drawing surface (the SDK, Orca chat mode): /filetree answers with a text tree and opens no pane', { timeoutMs: 20_000 }, async ($, on) => {
+  const ran: Ran = []
+  const root = '/home/k/proj'
+  const dirs = {
+    [root]: [['src', 'dir'], ['node_modules', 'dir'], ['README.md', 'file']] as [string, 'file' | 'dir'][],
+    [`${root}/src`]: [['a.ts', 'file'], ['lib', 'dir']] as [string, 'file' | 'dir'][],
+    [`${root}/src/lib`]: [['b.ts', 'file']] as [string, 'file' | 'dir'][],
+    [`${root}/node_modules`]: [['x', 'dir']] as [string, 'file' | 'dir'][],
+  }
+  const status = '## main...origin/main [ahead 2]\0 M src/a.ts\0 M src/lib/b.ts\0'
+  const clock = world(on, { os: 'linux', env: { HOME: '/home/k' }, cwd: root, top: root, dirs, status, numstat: '4\t2\tsrc/a.ts\0' + '1\t0\tsrc/lib/b.ts\0', surfaces: [] }, ran)
+  await $.session.start({ cwd: root, surface: null, isInteractive: false } as any)
+  await clock.settle()
+  const before = opens.length
+  const r = await $.command.run({ command: 'filetree', args: '', origin: { kind: 'person' }, presentation: { isFullscreen: false, columns: 80 } } as any)
+  const text = String((r as { text?: string }).text)
+  expect(opens.length).toBe(before)
+  expect(text).toContain('~/proj/  main → origin/main ↑2  M:2')
+  expect(text).toContain('├── src/  M:2')
+  expect(text).toContain('│   ├── lib/  M:1')
+  expect(text).toContain('│   └── a.ts  M +4 -2')
+  expect(text).toContain('M src/lib/b.ts  +1')
+  expect(ran.some(a => a[0] === 'git' && a.includes('status'))).toBe(true)
+  expect(text).toContain('├── node_modules/')
+  expect(text).not.toContain('x/')
+})
+
+test('text tree: a missing path or a file says so, and gitignored folders are never listed', { timeoutMs: 20_000 }, async ($, on) => {
+  const ran: Ran = []
+  const root = '/home/k/proj'
+  const dirs = { [root]: [['vendor', 'dir'], ['app', 'dir'], ['note.txt', 'file']] as [string, 'file' | 'dir'][], [`${root}/vendor`]: [['pkg', 'dir']] as [string, 'file' | 'dir'][], [`${root}/app`]: [] as [string, 'file' | 'dir'][] }
+  // vendor is unreadable here: listing it would raise a "could not list" toast.
+  const clock = world(on, { os: 'linux', env: { HOME: '/home/k' }, cwd: root, top: root, dirs, status: '!! vendor/\0', numstat: '', surfaces: [], denied: [`${root}/vendor`] }, ran)
+  await $.session.start({ cwd: root, surface: null, isInteractive: false } as any)
+  await clock.settle()
+  ran.length = 0
+  const run = async (args: string) => String(((await $.command.run({ command: 'filetree', args, origin: { kind: 'person' }, presentation: { isFullscreen: false, columns: 80 } } as any)) as { text?: string }).text)
+  const tree = await run('--depth 3')
+  expect(tree).toContain('├── vendor/  ignored')
+  expect(ran.some(a => a[0] === 'toast')).toBe(false)
+  expect(await run('nope')).toContain('No such folder: ~/proj/nope')
+  expect(await run('note.txt')).toContain('Not a folder: ~/proj/note.txt')
+})
+
+test('--text gives the text tree in a terminal too, without touching the pane',{ timeoutMs: 20_000 }, async ($, on) => {
+  const ran: Ran = []
+  const root = '/home/k/proj'
+  const clock = world(on, { os: 'linux', env: { HOME: '/home/k' }, cwd: root, top: '', dirs: { [root]: [['sub', 'dir']], [`${root}/sub`]: [['c.txt', 'file']] }, status: '', numstat: '' }, ran)
+  await $.session.start({ cwd: root, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const before = opens.length
+  const r = await $.command.run({ command: 'filetree', args: 'sub --text', origin: { kind: 'person' }, presentation: { isFullscreen: true, columns: 200 } } as any)
+  const text = String((r as { text?: string }).text)
+  expect(opens.length).toBe(before)
+  expect(text).toContain('~/proj/sub/')
+  expect(text).toContain('└── c.txt')
 })
 
 const shimmer = (name: string, tone: string) => `"t":${JSON.stringify(name)},"sh":"${tone}"`

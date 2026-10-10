@@ -4,6 +4,7 @@ import { openCommand } from './open'
 import type { Activity, FileNode, FileTree, Theme } from '../types'
 import { BRANCH_ICON, chainOf, type GitAction, gitActions, readOnly, readTargets, resolve, TONES } from './git'
 import type { RowSpec, RowsProps, Seg } from './rows'
+import { parseTextArgs, renderTextTree, type TextGit, TEXT_MAX_DIRS, TEXT_MAX_LINES, TEXT_MAX_PER_DIR } from './text'
 import { CHEVRON_CLOSED, CHEVRON_OPEN, fileIcon, GIT_COLOR } from './icons'
 import {
   ancestorsOf,
@@ -63,6 +64,7 @@ const HOME_PRUNE = ['Library', 'AppData', '.Trash']
 const SIZE_TIMEOUT_MS = 15_000
 const SIZE_JOBS = 2
 const SIZE_WALK_LIMIT = 50_000
+const INLINE_ROWS = 20
 
 let blink: Timer | null = null
 let themePoll: Timer | null = null
@@ -86,6 +88,7 @@ let pointer = true
 let view = { from: 0, max: 0 }
 let lastSync = 0
 let noDock = false
+let inlineAsked = false
 let home = ''
 let platform: Promise<'linux' | 'darwin' | 'win32'> | null = null
 let dirty: { root: string; files: Record<string, Change> } = { root: '', files: {} }
@@ -211,39 +214,80 @@ async function detectRepo($: EngineInterface): Promise<void> {
   await patch($, cur => (cur.root === t.root ? { top, prefix } : {}))
 }
 
+type GitSnapshot = TextGit & { untrackedDirs: string[]; files: Record<string, Change> }
+
+async function gitSnapshot($: EngineInterface, root: string, prefix: string): Promise<GitSnapshot | null> {
+  const status = await git($, root, ['status', '--porcelain=v1', '-b', '-z', '--ignored=traditional', '--untracked-files=normal', '--', '.'])
+  if (status.exitCode !== 0) return null
+  const parsed = parseGit(status.stdout, root, prefix)
+  const diff: Record<string, [number, number]> = {}
+  const head = await git($, root, ['diff', 'HEAD', '--numstat', '-z', '--', '.'])
+  if (head.exitCode === 0) parseNumstat(head.stdout, root, prefix, diff)
+  const files = { ...parsed.files }
+  if (parsed.untrackedDirs.length) {
+    const others = await git($, root, ['ls-files', '-o', '--exclude-standard', '-z', '--', ...parsed.untrackedDirs.map(d => d.slice(root.length + 1) || '.')])
+    if (others.exitCode === 0) for (const rel of others.stdout.split('\0').filter(Boolean)) files[join(root, rel)] = 'new'
+  }
+  for (const path of Object.keys(diff)) if (files[path] === 'new') delete diff[path]
+  return { git: parsed.git, ignored: parsed.ignored, untrackedDirs: parsed.untrackedDirs, branch: parsed.branch, files, counts: rollCounts(files, root), diff }
+}
+
 async function readGit($: EngineInterface): Promise<void> {
   const t = await get($)
   if (!t.root || !t.top) return
   const root = t.root
   try {
-    const status = await git($, root, ['status', '--porcelain=v1', '-b', '-z', '--ignored=traditional', '--untracked-files=normal', '--', '.'])
-    if (status.exitCode !== 0) return
-    const parsed = parseGit(status.stdout, root, t.prefix)
-    const diff: Record<string, [number, number]> = {}
-    const head = await git($, root, ['diff', 'HEAD', '--numstat', '-z', '--', '.'])
-    if (head.exitCode === 0) parseNumstat(head.stdout, root, t.prefix, diff)
-    const files = { ...parsed.files }
-    if (parsed.untrackedDirs.length) {
-      const others = await git($, root, ['ls-files', '-o', '--exclude-standard', '-z', '--', ...parsed.untrackedDirs.map(d => d.slice(root.length + 1) || '.')])
-      if (others.exitCode === 0) for (const rel of others.stdout.split('\0').filter(Boolean)) files[join(root, rel)] = 'new'
-    }
-    for (const path of Object.keys(diff)) if (files[path] === 'new') delete diff[path]
-    dirty = { root, files }
+    const snap = await gitSnapshot($, root, t.prefix)
+    if (!snap) return
+    dirty = { root, files: snap.files }
     await patch($, cur =>
       cur.root === root
         ? {
-            git: parsed.git,
-            ignored: parsed.ignored,
-            untrackedDirs: parsed.untrackedDirs,
-            branch: parsed.branch,
-            counts: rollCounts(files, root),
-            diff: rollUp(diff, root),
+            git: snap.git,
+            ignored: snap.ignored,
+            untrackedDirs: snap.untrackedDirs,
+            branch: snap.branch,
+            counts: snap.counts,
+            diff: rollUp(snap.diff, root),
           }
         : {},
     )
   } catch {
     return
   }
+}
+
+// For sessions with no drawing surface (the SDK, as Orca's chat mode runs it): the tree as text in the command output.
+async function textTree($: EngineInterface, root: string, depth: number): Promise<string> {
+  const stat = await $.fs.stat(root).catch(() => null)
+  if (!stat) return `No such folder: ${shortPath(root)}`
+  if (stat.kind !== 'dir') return `Not a folder: ${shortPath(root)}`
+  let snap: GitSnapshot | null = null
+  try {
+    const run = await git($, root, ['rev-parse', '--show-prefix', '--show-toplevel'], 5_000)
+    if (run.exitCode === 0) snap = await gitSnapshot($, root, (run.stdout.split('\n')[0] ?? '').trim())
+  } catch {
+    snap = null
+  }
+  const ignored = new Set(snap?.ignored ?? [])
+  const listed = new Map<string, FileNode[]>()
+  let frontier = [root]
+  let budget = TEXT_MAX_DIRS
+  for (let level = 0; level < depth && frontier.length && budget > 0; level++) {
+    const batch = frontier.slice(0, budget)
+    budget -= batch.length
+    const results = await Promise.all(batch.map(async dir => [dir, await list($, dir)] as const))
+    frontier = []
+    for (const [dir, kids] of results) {
+      if (!kids) continue
+      listed.set(dir, kids)
+      const skip = dir === home ? [...PRUNE, ...HOME_PRUNE] : PRUNE
+      const dirs = kids.filter(n => !n.hidden).slice(0, TEXT_MAX_PER_DIR).filter(n => n.kind === 'dir' && !skip.includes(n.name) && !ignored.has(n.id))
+      frontier.push(...dirs.map(n => n.id))
+    }
+  }
+  if (!listed.has(root)) return `Cannot read ${shortPath(root)}`
+  return renderTextTree({ root, label: shortPath(root), listed, git: snap, depth, maxLines: TEXT_MAX_LINES, maxPerDir: TEXT_MAX_PER_DIR })
 }
 
 function refreshGit($: EngineInterface): Promise<void> {
@@ -261,7 +305,7 @@ function refreshGit($: EngineInterface): Promise<void> {
   return gitNext
 }
 
-async function reset($: EngineInterface, root: string, focus = false): Promise<void> {
+async function reset($: EngineInterface, root: string, focus = false, inline = false): Promise<void> {
   const prev = await get($)
   generation += 1
   blink?.cancel()
@@ -272,7 +316,7 @@ async function reset($: EngineInterface, root: string, focus = false): Promise<v
   sizeQueue = []
   await put($, () => ({ ...emptyTree(root), showHidden: prev.showHidden, showSize: prev.root ? prev.showSize : sizeDefault }))
   const title = `Files: ${root.split('/').pop() || root}`
-  if (focus) await $.ui.open({ id: PANE, title, focus: true })
+  if (focus) await $.ui.open({ id: PANE, title, focus: true, ...(inline ? { rows: INLINE_ROWS } : {}) })
   else if (!noDock) await $.ui.open({ id: PANE, title })
   await loadDirs($, [root])
   await detectRepo($)
@@ -934,7 +978,7 @@ export const register: Register = (on, options) => {
   followClaude = options?.follow !== 'off'
   sizeDefault = options?.column === 'size'
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'filetree', description: 'Show the file tree; args: [path] (no path = cwd)' })
+    await $.command.register({ name: 'filetree', description: 'Show the file tree; args: [path] [--text] [--depth N] (no path = cwd)' })
     const windows = (await $.env.get('OS')) === 'Windows_NT'
     useDrives(windows)
     home = posix(((await $.env.get('HOME')) || (await $.env.get('USERPROFILE')) || '').replace(/[\\/]+$/, ''))
@@ -961,15 +1005,17 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'filetree' }, async ($, e) => {
-    if (!e.presentation.isFullscreen) return { text: 'filetree shows in the sidebar, which needs the fullscreen layout. Run /tui fullscreen, then /filetree.' }
-    if (e.presentation.columns < 110) return { text: 'filetree shows in the sidebar, which needs a terminal at least 110 columns wide. Widen it, then run /filetree.' }
-    noDock = false
-    const arg = (e.args ?? '').trim()
+    const args = parseTextArgs(e.args ?? '')
     const cwd = await cwdOf($)
-    follow = !arg
-    const root = arg ? resolve(cwd, arg, home) : cwd
-    await reset($, root, true)
-    return { text: `File tree on ${shortPath(root)}${follow ? ' (follows the cwd)' : ''}.` }
+    const target = args.path ? resolve(cwd, args.path, home) : cwd
+    const surfaces = await $.session.surfaces().catch(() => ['terminal'] as const)
+    if (args.text || surfaces.length === 0) return { text: await textTree($, target, args.depth) }
+    const docked = e.presentation.isFullscreen && e.presentation.columns >= 110
+    noDock = false
+    inlineAsked = !docked
+    follow = !args.path
+    await reset($, target, true, !docked)
+    return { text: `File tree on ${shortPath(target)}${follow ? ' (follows the cwd)' : ''}${docked ? '' : ' (inline; Esc returns to the prompt)'}.` }
   })
 
   on('tool.call', async ($, e, next) => {
@@ -1075,6 +1121,14 @@ export const register: Register = (on, options) => {
     return {}
   })
 
+  on('ui.close', { id: PANE }, async ($, e, next) => {
+    if (inlineAsked) {
+      inlineAsked = false
+      if (e.origin.kind === 'person') noDock = true
+    }
+    return next(e)
+  })
+
   on('classic.SessionStart', async ($, e, next) => {
     const result = await next(e)
     if (e.source === 'clear' || e.source === 'resume' || e.source === 'fork') {
@@ -1149,7 +1203,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
-    if (e.surface === 'terminal' && e.props.placement === 'inline') {
+    if (e.surface === 'terminal' && e.props.placement === 'inline' && !inlineAsked) {
       noDock = true
       void $.ui.close({ id: PANE }).catch(() => undefined)
       const { Box: Empty } = $.ui.resolve(e)

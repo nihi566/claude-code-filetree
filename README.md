@@ -6,7 +6,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-%E2%89%A5_2.1.287-D97757?logo=claude&logoColor=fff" alt="Claude Code 2.1.287 or newer">
-  <img src="https://img.shields.io/badge/version-0.2.24-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.3.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/type-mod-6f42c1" alt="Claude Code mod">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
@@ -16,7 +16,17 @@
 </p>
 
 > [!NOTE]
-> filetree is a Claude Code **mod** and needs **Claude Code 2.1.287+**. It shows in the right sidebar, which needs the fullscreen layout (`/tui fullscreen`) and a terminal at least 110 columns wide. Tested on Linux, macOS and Windows; mods don't load in WSL sessions of the Desktop app.
+> This is a fork of [data-goblin/claude-code-filetree](https://github.com/data-goblin/claude-code-filetree). filetree is a Claude Code **mod** and needs **Claude Code 2.1.287+**. Tested on Linux, macOS and Windows; mods don't load in WSL sessions of the Desktop app.
+
+## What this fork changes
+
+| Where Claude Code runs | Upstream | This fork |
+| --- | --- | --- |
+| Terminal, fullscreen layout, 110+ columns | Right sidebar | Right sidebar (unchanged) |
+| Terminal main screen, or narrower than 110 columns | `/filetree` refuses | `/filetree` opens the tree inline above the prompt (Esc returns to the prompt) |
+| No drawing surface: the SDK, `claude -p`, chat UIs built on it such as Orca's chat mode | Nothing shows | `/filetree` answers with the tree as text: box-drawn lines, git status, `+N -N` per file, and the changes below the depth listed after it |
+
+`/filetree [path] [--text] [--depth N]`: `--text` gives the text tree anywhere; `--depth N` (1-6, default 2) sets how many levels it lists.
 
 ---
 
@@ -25,18 +35,18 @@
 The repo is its own plugin marketplace. Run this in the terminal:
 
 ```bash
-claude plugin marketplace add data-goblin/claude-code-filetree
-claude plugin install filetree@claude-code-filetree
+claude plugin marketplace add nihi566/claude-code-filetree
+claude plugin install filetree@filetree-nihi566
 ```
 
 Or inside a Claude Code session:
 
 ```text
-/plugin marketplace add data-goblin/claude-code-filetree
-/plugin install filetree@claude-code-filetree
+/plugin marketplace add nihi566/claude-code-filetree
+/plugin install filetree@filetree-nihi566
 ```
 
-Installed it as `filetree@filetree` before the repository was renamed? Nothing to do: that install keeps loading and keeps receiving updates.
+Have upstream's `filetree@claude-code-filetree` installed? Uninstall it first (`claude plugin uninstall filetree@claude-code-filetree`): both register `/filetree`.
 
 ## Features
 
