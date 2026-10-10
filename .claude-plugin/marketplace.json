@@ -1,7 +1,7 @@
 {
-  "name": "claude-code-filetree",
+  "name": "filetree-nihi566",
   "owner": {
-    "name": "Kurt Buhler"
+    "name": "nihi566"
   },
   "metadata": {
     "description": "An IDE-style file tree for Claude Code that shows what Claude is doing and where in files"
